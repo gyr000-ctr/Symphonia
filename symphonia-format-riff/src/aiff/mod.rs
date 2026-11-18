@@ -26,7 +26,8 @@ use symphonia_core::support_format;
 use log::debug;
 
 use crate::common::{
-    ByteOrder, ChunksReader, PacketInfo, append_data_params, append_format_params, next_packet,
+    ByteOrder, ChunksReader, IdentityResolver, PacketInfo, append_data_params,
+    append_format_params, next_packet,
 };
 mod chunks;
 use chunks::*;
@@ -107,7 +108,9 @@ impl<'s> AiffReader<'s> {
         let mut builder = MetadataBuilder::new(AIFF_METADATA_INFO);
 
         // Scan over all chunks.
-        while let Some(chunk) = riff_chunks.next(&mut mss)? {
+        let mut resolver = IdentityResolver;
+
+        while let Some(chunk) = riff_chunks.next(&mut mss, &mut resolver)? {
             match chunk {
                 RiffAiffChunks::Common(chunk) => {
                     // Only one common chunk is allowed.
@@ -373,7 +376,7 @@ impl FormatReader for AiffReader<'_> {
             &self.packet_info,
             &self.tracks,
             self.data_start_pos,
-            self.data_end_pos.unwrap_or(u64::MAX),
+            self.data_end_pos,
         )
     }
 

@@ -23,8 +23,9 @@ use symphonia_core::meta::{MetadataBuilder, MetadataRevision};
 use symphonia_metadata::embedded::riff;
 
 use crate::common::{
-    ByteOrder, ChunkParser, ChunksReader, FormatALaw, FormatAdpcm, FormatData, FormatExtensible,
-    FormatIeeeFloat, FormatMuLaw, FormatPcm, NullChunks, PacketInfo, ParseChunk, ParseChunkTag,
+    ByteOrder, ChunkLenResolver, ChunkParser, ChunksReader, FormatALaw, FormatAdpcm, FormatData,
+    FormatExtensible, FormatIeeeFloat, FormatMuLaw, FormatPcm, NullChunks, PacketInfo, ParseChunk,
+    ParseChunkTag, chunk_len_u32,
 };
 
 use log::info;
@@ -409,7 +410,10 @@ impl WaveFormatChunk {
 }
 
 impl ParseChunk for WaveFormatChunk {
-    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], len: u32) -> Result<WaveFormatChunk> {
+    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], len: u64) -> Result<WaveFormatChunk> {
+        // The format chunk body is constrained to 32-bits because its internal length fields are.
+        let len = chunk_len_u32(len)?;
+
         // WaveFormat has a minimal length of 16 bytes. This may be extended with format specific
         // data later.
         if len < 16 {
@@ -540,7 +544,7 @@ pub struct FactChunk {
 }
 
 impl ParseChunk for FactChunk {
-    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], len: u32) -> Result<Self> {
+    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], len: u64) -> Result<Self> {
         // A Fact chunk is exactly 4 bytes long, though there is some mystery as to whether there
         // can be more fields in the chunk.
         if len != 4 {
@@ -561,17 +565,17 @@ impl fmt::Display for FactChunk {
 
 pub struct ListChunk {
     pub form: [u8; 4],
-    pub len: u32,
+    pub len: u64,
 }
 
 impl ListChunk {
     pub fn skip<B: ReadBytes>(&self, reader: &mut B) -> Result<()> {
-        ChunksReader::<NullChunks>::new(Some(self.len), ByteOrder::LittleEndian).finish(reader)
+        ChunksReader::<NullChunks>::new_riff(Some(self.len), ByteOrder::LittleEndian).finish(reader)
     }
 }
 
 impl ParseChunk for ListChunk {
-    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], len: u32) -> Result<Self> {
+    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], len: u64) -> Result<Self> {
         // A List chunk must contain atleast the list/form identifier. However, an empty list
         // (len == 4) is permissible.
         if len < 4 {
@@ -597,22 +601,26 @@ pub struct InfoChunk {
 }
 
 impl ParseChunk for InfoChunk {
-    fn parse<B: ReadBytes>(reader: &mut B, tag: [u8; 4], len: u32) -> Result<InfoChunk> {
+    fn parse<B: ReadBytes>(reader: &mut B, tag: [u8; 4], len: u64) -> Result<InfoChunk> {
         // TODO: Apply limit.
-        let buf = reader.read_boxed_slice_exact(len as usize)?;
+        let buf_len =
+            usize::try_from(len).map_err(|_| Error::DecodeError("wav: info chunk is too large"))?;
+        let buf = reader.read_boxed_slice_exact(buf_len)?;
         Ok(InfoChunk { tag, buf })
     }
 }
 
 pub struct DataChunk {
-    pub len: Option<u32>,
+    pub len: Option<u64>,
 }
 
 impl ParseChunk for DataChunk {
-    fn parse<B: ReadBytes>(_: &mut B, _: [u8; 4], len: u32) -> Result<DataChunk> {
-        // If the length us u32::MAX, that usually indicates the file is streaming and the length
-        // is not known.
-        Ok(DataChunk { len: Some(len).filter(|&len| len != u32::MAX) })
+    fn parse<B: ReadBytes>(_: &mut B, _: [u8; 4], len: u64) -> Result<DataChunk> {
+        // If the length is u32::MAX, that usually indicates the file is streaming and the length
+        // is not known. RF64 files resolve the placeholder to the true length via the `ds64`
+        // chunk before this parser is invoked, so only classic RIFF streaming files reach this
+        // filter.
+        Ok(DataChunk { len: Some(len).filter(|&len| len != u64::from(u32::MAX)) })
     }
 }
 
@@ -621,6 +629,7 @@ pub enum RiffWaveChunks {
     List(ChunkParser<ListChunk>),
     Fact(ChunkParser<FactChunk>),
     Data(ChunkParser<DataChunk>),
+    Ds64(ChunkParser<Ds64Chunk>),
 }
 
 macro_rules! parser {
@@ -630,12 +639,13 @@ macro_rules! parser {
 }
 
 impl ParseChunkTag for RiffWaveChunks {
-    fn parse_tag(tag: [u8; 4], len: u32) -> Option<Self> {
+    fn parse_tag(tag: [u8; 4], len: u64) -> Option<Self> {
         match &tag {
             b"fmt " => parser!(RiffWaveChunks::Format, WaveFormatChunk, tag, len),
             b"LIST" => parser!(RiffWaveChunks::List, ListChunk, tag, len),
             b"fact" => parser!(RiffWaveChunks::Fact, FactChunk, tag, len),
             b"data" => parser!(RiffWaveChunks::Data, DataChunk, tag, len),
+            b"ds64" => parser!(RiffWaveChunks::Ds64, Ds64Chunk, tag, len),
             _ => None,
         }
     }
@@ -646,7 +656,7 @@ pub enum RiffInfoListChunks {
 }
 
 impl ParseChunkTag for RiffInfoListChunks {
-    fn parse_tag(tag: [u8; 4], len: u32) -> Option<Self> {
+    fn parse_tag(tag: [u8; 4], len: u64) -> Option<Self> {
         // Right now it is assumed all list chunks are INFO chunks, but that's not really
         // guaranteed.
         //
@@ -655,16 +665,134 @@ impl ParseChunkTag for RiffInfoListChunks {
     }
 }
 
+/// The placeholder length stored in 32-bit length fields of RF64 chunks whose true length does
+/// not fit in 32 bits.
+pub const RF64_SIZE_PLACEHOLDER: u32 = u32::MAX;
+
+/// `Ds64Chunk` is the mandatory first chunk of an RF64 (or BW64) file. It stores the true 64-bit
+/// lengths of the top-level RIFF chunk and the data chunk, along with a table of true lengths for
+/// any other chunks that required the `0xFFFFFFFF` placeholder.
+pub struct Ds64Chunk {
+    /// True length of the top-level RIFF chunk, excluding the 8-byte RIFF header but including the
+    /// 4-byte form type.
+    pub riff_size: u64,
+    /// True length of the data chunk.
+    pub data_size: u64,
+    /// Number of sample frames, or `0` if unknown. Retained for completeness of the ds64 chunk;
+    /// the data chunk length and fact chunk take precedence when computing track duration.
+    #[allow(dead_code)]
+    pub sample_count: u64,
+    /// Additional 64-bit chunk sizes keyed by 4-byte chunk tag.
+    table: Vec<([u8; 4], u64)>,
+}
+
+impl Ds64Chunk {
+    /// Returns the true length of a non-data chunk recorded in the table, if present.
+    pub fn table_size(&self, tag: [u8; 4]) -> Option<u64> {
+        self.table.iter().find(|(entry_tag, _)| *entry_tag == tag).map(|(_, len)| *len)
+    }
+}
+
+impl ParseChunk for Ds64Chunk {
+    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], len: u64) -> Result<Self> {
+        // The fixed part of the ds64 body is 28 bytes: three 64-bit fields and a 32-bit table
+        // entry count.
+        const DS64_FIXED_LEN: u64 = 28;
+        const DS64_TABLE_ENTRY_LEN: u64 = 12;
+
+        if len < DS64_FIXED_LEN {
+            return decode_error("wav: malformed ds64 chunk");
+        }
+
+        let riff_size = reader.read_u64()?;
+        let data_size = reader.read_u64()?;
+        let sample_count = reader.read_u64()?;
+        let table_len = reader.read_u32()?;
+
+        let table_bytes = u64::from(table_len)
+            .checked_mul(DS64_TABLE_ENTRY_LEN)
+            .ok_or(Error::DecodeError("wav: ds64 table length overflow"))?;
+
+        if table_bytes > len - DS64_FIXED_LEN {
+            return decode_error("wav: ds64 table length exceeds chunk length");
+        }
+
+        let mut table = Vec::with_capacity(table_len as usize);
+
+        for _ in 0..table_len {
+            let tag = reader.read_quad_bytes()?;
+            let size = reader.read_u64()?;
+            table.push((tag, size));
+        }
+
+        // Any remaining bytes are reserved for future use; ignore them so the stream is positioned
+        // at the next chunk header.
+        let consumed = DS64_FIXED_LEN + table_bytes;
+
+        if consumed < len {
+            reader.ignore_bytes(len - consumed)?;
+        }
+
+        Ok(Ds64Chunk { riff_size, data_size, sample_count, table })
+    }
+}
+
+/// Resolves RF64 placeholder lengths (`0xFFFFFFFF`) against a parsed `ds64` chunk.
+pub struct Rf64Resolver<'a> {
+    ds64: &'a Ds64Chunk,
+}
+
+impl<'a> Rf64Resolver<'a> {
+    pub fn new(ds64: &'a Ds64Chunk) -> Self {
+        Rf64Resolver { ds64 }
+    }
+}
+
+impl ChunkLenResolver for Rf64Resolver<'_> {
+    fn resolve(&mut self, tag: [u8; 4], on_disk_len: u64) -> Result<u64> {
+        if on_disk_len != u64::from(RF64_SIZE_PLACEHOLDER) {
+            // A chunk with a concrete 32-bit length must agree with any true length recorded for
+            // it in ds64. The data chunk's true length is ds64.data_size; other chunks use the
+            // ds64 table.
+            let ds64_len =
+                if tag == *b"data" { Some(self.ds64.data_size) } else { self.ds64.table_size(tag) };
+
+            if let Some(ds64_len) = ds64_len {
+                if ds64_len != on_disk_len {
+                    return decode_error("wav: ds64 chunk size conflicts with chunk header length");
+                }
+            }
+
+            return Ok(on_disk_len);
+        }
+
+        // The placeholder may only be used by chunks whose true length is recorded in ds64.
+        let true_len = if tag == *b"data" {
+            self.ds64.data_size
+        }
+        else {
+            match self.ds64.table_size(tag) {
+                Some(len) => len,
+                None => return decode_error("wav: rf64 placeholder length missing from ds64"),
+            }
+        };
+
+        Ok(true_len)
+    }
+}
+
 pub fn append_fact_params(track: &mut Track, fact: &FactChunk) {
     track.with_num_frames(u64::from(fact.num_frames));
 }
 
-pub fn read_info_chunk(source: &mut MediaSourceStream<'_>, len: u32) -> Result<MetadataRevision> {
+pub fn read_info_chunk(source: &mut MediaSourceStream<'_>, len: u64) -> Result<MetadataRevision> {
     let mut builder = MetadataBuilder::new(WAVE_METADATA_INFO);
 
-    let mut list = ChunksReader::<RiffInfoListChunks>::new(Some(len), ByteOrder::LittleEndian);
+    let mut list = ChunksReader::<RiffInfoListChunks>::new_riff(Some(len), ByteOrder::LittleEndian);
 
-    while let Some(RiffInfoListChunks::Info(info)) = list.next(source)? {
+    let mut resolver = crate::common::IdentityResolver;
+
+    while let Some(RiffInfoListChunks::Info(info)) = list.next(source, &mut resolver)? {
         let info = info.parse(source)?;
         // Ignore errors while parsing one chunk.
         let _ = riff::parse_riff_info_chunk(info.tag, &info.buf, &mut builder);

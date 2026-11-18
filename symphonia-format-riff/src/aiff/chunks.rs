@@ -25,7 +25,7 @@ use symphonia_metadata::embedded::riff;
 
 use crate::common::{
     ChunkParser, FormatALaw, FormatData, FormatIeeeFloat, FormatMuLaw, FormatPcm, PacketInfo,
-    ParseChunk, ParseChunkTag,
+    ParseChunk, ParseChunkTag, chunk_len_u32,
 };
 
 use extended::Extended;
@@ -197,7 +197,7 @@ impl CommonChunk {
 }
 
 impl ParseChunk for CommonChunk {
-    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], _: u32) -> Result<CommonChunk> {
+    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], _len: u64) -> Result<CommonChunk> {
         let num_channels = reader.read_be_u16()?;
         let num_sample_frames = reader.read_be_u32()?;
         let sample_size = reader.read_be_u16()?;
@@ -309,7 +309,10 @@ impl SoundChunk {
 }
 
 impl ParseChunk for SoundChunk {
-    fn parse<B: ReadBytes>(reader: &mut B, _: [u8; 4], len: u32) -> Result<SoundChunk> {
+    fn parse<B: ReadBytes>(reader: &mut B, _: [u8; 4], len: u64) -> Result<SoundChunk> {
+        // AIFF chunk lengths are 32-bit fields.
+        let len = chunk_len_u32(len)?;
+
         // Validate minimum size.
         if len < 8 {
             return decode_error("aiff: invalid chunk size for sound chunk");
@@ -347,7 +350,7 @@ pub struct Marker {
 }
 
 impl ParseChunk for MarkerChunk {
-    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], _len: u32) -> Result<Self> {
+    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], _len: u64) -> Result<Self> {
         let num_markers = reader.read_be_u16()?;
 
         let mut markers = Vec::with_capacity(usize::from(num_markers));
@@ -370,7 +373,9 @@ pub struct AppSpecificChunk {
 }
 
 impl ParseChunk for AppSpecificChunk {
-    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], len: u32) -> Result<Self> {
+    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], len: u64) -> Result<Self> {
+        // AIFF chunk lengths are 32-bit fields.
+        let len = chunk_len_u32(len)?;
         let start_pos = reader.pos();
 
         // The application signature.
@@ -408,7 +413,7 @@ pub struct Comment {
 }
 
 impl ParseChunk for CommentsChunk {
-    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], _len: u32) -> Result<Self> {
+    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], _len: u64) -> Result<Self> {
         let num_comments = reader.read_be_u16()?;
 
         let mut comments = Vec::with_capacity(usize::from(num_comments));
@@ -431,7 +436,8 @@ pub struct TextChunk {
 }
 
 impl ParseChunk for TextChunk {
-    fn parse<B: ReadBytes>(reader: &mut B, tag: [u8; 4], len: u32) -> Result<Self> {
+    fn parse<B: ReadBytes>(reader: &mut B, tag: [u8; 4], len: u64) -> Result<Self> {
+        let len = chunk_len_u32(len)?;
         let text = reader.read_boxed_slice_exact(len as usize)?;
 
         let value = Arc::new(decode_string(&text));
@@ -459,7 +465,7 @@ pub struct Id3Chunk {
 }
 
 impl ParseChunk for Id3Chunk {
-    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], _len: u32) -> Result<Self> {
+    fn parse<B: ReadBytes>(reader: &mut B, _tag: [u8; 4], _len: u64) -> Result<Self> {
         let mut side_data = Vec::new();
         let metadata = riff::read_riff_id3_chunk(reader, &mut side_data)?;
         Ok(Id3Chunk { metadata })
@@ -483,7 +489,7 @@ macro_rules! parser {
 }
 
 impl ParseChunkTag for RiffAiffChunks {
-    fn parse_tag(tag: [u8; 4], len: u32) -> Option<Self> {
+    fn parse_tag(tag: [u8; 4], len: u64) -> Option<Self> {
         match &tag {
             b"COMM" => parser!(RiffAiffChunks::Common, CommonChunk, tag, len),
             b"SSND" => parser!(RiffAiffChunks::Sound, SoundChunk, tag, len),
