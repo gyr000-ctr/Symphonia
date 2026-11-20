@@ -11,7 +11,7 @@ use symphonia_core::checksum::Crc16AnsiLe;
 use symphonia_core::codecs::CodecParameters;
 use symphonia_core::codecs::audio::AudioCodecParameters;
 use symphonia_core::codecs::audio::well_known::{CODEC_ID_MP1, CODEC_ID_MP2, CODEC_ID_MP3};
-use symphonia_core::errors::{Error, Result, SeekErrorKind, seek_error};
+use symphonia_core::errors::{Error, Result, SeekErrorKind, decode_error, seek_error};
 use symphonia_core::formats::prelude::*;
 use symphonia_core::formats::probe::{ProbeFormatData, ProbeableFormat, Score, Scoreable};
 use symphonia_core::formats::well_known::{FORMAT_ID_MP1, FORMAT_ID_MP2, FORMAT_ID_MP3};
@@ -19,7 +19,7 @@ use symphonia_core::io::*;
 use symphonia_core::meta::{Metadata, MetadataLog};
 
 use crate::common::{FrameHeader, MpegLayer};
-use crate::header::{self, MAX_MPEG_FRAME_SIZE, MPEG_HEADER_LEN};
+use crate::header::{self, MAX_FREE_FORMAT_FRAME_SIZE, MAX_MPEG_FRAME_SIZE, MPEG_HEADER_LEN};
 
 use std::io::{Seek, SeekFrom};
 
@@ -45,6 +45,13 @@ pub struct MpaReader<'s> {
     metadata: MetadataLog,
     first_packet_pos: u64,
     next_packet_ts: Timestamp,
+    /// The frame size (excluding the header) derived for free bit-rate frames, if any.
+    ///
+    /// Free bit-rate frames do not encode their frame size. It is derived from the position of the
+    /// next frame's sync word. Since a free bit-rate stream generally uses a constant frame size,
+    /// the derived size is cached so that the final frame, which has no following sync word, can
+    /// also be read.
+    free_format_frame_size: Option<usize>,
 }
 
 impl Scoreable for MpaReader<'_> {
@@ -52,6 +59,18 @@ impl Scoreable for MpaReader<'_> {
         // Read the sync word for the first (assumed) MPEG frame and try to parse it into a header.
         let sync1 = header::read_frame_header_word_no_sync(&mut src)?;
         let hdr1 = header::parse_frame_header(sync1)?;
+
+        // Free bit-rate frames do not encode their frame size. Search for the next frame's sync
+        // word from the start of this frame's body. The search already verifies that the next
+        // sync word parses into a similar frame header, so a match is a high confidence result. If
+        // no following frame is found, then this is likely a single free bit-rate frame, so return
+        // a partially confident score.
+        if hdr1.is_free_format() {
+            return match scan_next_frame_sync(&mut src, &hdr1)? {
+                Some(_) => Ok(Score::Supported(255)),
+                None => Ok(Score::Supported(127)),
+            };
+        }
 
         // Since the first header was parsed successfully, this may be a MPEG audio format. However,
         // if there is enough data left to read the frame body and another frame header, then a
@@ -160,15 +179,18 @@ impl FormatReader for MpaReader<'_> {
     fn next_packet(&mut self) -> Result<Option<Packet>> {
         let (header, data) = loop {
             // Read the next MPEG frame.
-            let (header, data) = match read_mpeg_frame(&mut self.reader) {
-                Ok(frame) => frame,
-                Err(Error::IoError(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // MPEG streams have no well-defined end, so when no more frames can be read,
-                    // consider the stream ended.
-                    return Ok(None);
-                }
-                Err(err) => return Err(err),
-            };
+            let (header, data) =
+                match read_mpeg_frame(&mut self.reader, &mut self.free_format_frame_size) {
+                    Ok(frame) => frame,
+                    Err(Error::IoError(err))
+                        if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        // MPEG streams have no well-defined end, so when no more frames can be
+                        // read, consider the stream ended.
+                        return Ok(None);
+                    }
+                    Err(err) => return Err(err),
+                };
 
             // Check if the packet contains a Xing, Info, or VBRI tag.
             if is_maybe_info_tag(&data, &header) {
@@ -387,7 +409,20 @@ impl FormatReader for MpaReader<'_> {
             };
 
             // Otherwise, ignore the frame body.
-            self.reader.ignore_bytes(header.frame_size as u64)?;
+            if header.is_free_format() {
+                // Free bit-rate frames do not encode their frame size. The reader is positioned at
+                // the start of the frame body, which is then ignored.
+                let frame_size = resolve_free_format_frame_size(
+                    &mut self.reader,
+                    &header,
+                    &mut self.free_format_frame_size,
+                )?;
+
+                self.reader.ignore_bytes(frame_size as u64)?;
+            }
+            else {
+                self.reader.ignore_bytes(header.frame_size as u64)?;
+            }
 
             // Increment the timestamp for the next packet.
             self.next_packet_ts = next_packet_ts;
@@ -412,8 +447,11 @@ impl FormatReader for MpaReader<'_> {
 
 impl<'s> MpaReader<'s> {
     pub fn try_new(mut mss: MediaSourceStream<'s>, opts: FormatOptions) -> Result<Self> {
+        // The frame size derived for free bit-rate frames, if any.
+        let mut free_format_frame_size = None;
+
         // Try to read the first MPEG frame.
-        let (header, packet) = read_mpeg_frame_strict(&mut mss)?;
+        let (header, packet) = read_mpeg_frame_strict(&mut mss, &mut free_format_frame_size)?;
 
         // Use the header to populate the codec parameters.
         let mut codec_params = AudioCodecParameters::new();
@@ -465,7 +503,9 @@ impl<'s> MpaReader<'s> {
             if mss.is_seekable() {
                 info!("estimating duration from bitrate, may be inaccurate for vbr files");
 
-                if let Some(n_mpeg_frames) = estimate_num_mpeg_frames(&mut mss) {
+                if let Some(n_mpeg_frames) =
+                    estimate_num_mpeg_frames(&mut mss, &mut free_format_frame_size)
+                {
                     track.with_num_frames(n_mpeg_frames * u64::from(header.num_frames()));
                 }
             }
@@ -487,6 +527,7 @@ impl<'s> MpaReader<'s> {
             metadata: opts.external_data.metadata.unwrap_or_default(),
             first_packet_pos,
             next_packet_ts,
+            free_format_frame_size,
         })
     }
 
@@ -535,7 +576,8 @@ impl<'s> MpaReader<'s> {
         ))?;
 
         // Resync to the start of the next MPEG frame.
-        let (header, _) = read_mpeg_frame_strict(&mut self.reader)?;
+        let (header, _) =
+            read_mpeg_frame_strict(&mut self.reader, &mut self.free_format_frame_size)?;
 
         // The byte position of the next MPEG frame relative to the start of the audio data.
         let audio_byte_pos = u128::from(self.reader.pos() - self.first_packet_pos);
@@ -582,8 +624,11 @@ impl<'s> MpaReader<'s> {
 }
 
 /// Reads a MPEG frame and returns the header and buffer.
-fn read_mpeg_frame(reader: &mut MediaSourceStream<'_>) -> Result<(FrameHeader, Vec<u8>)> {
-    let (header, header_word) = loop {
+fn read_mpeg_frame(
+    reader: &mut MediaSourceStream<'_>,
+    free_format_frame_size: &mut Option<usize>,
+) -> Result<(FrameHeader, Vec<u8>)> {
+    let (mut header, header_word) = loop {
         // Sync to the next frame header.
         let sync = header::sync_frame(reader)?;
 
@@ -594,6 +639,13 @@ fn read_mpeg_frame(reader: &mut MediaSourceStream<'_>) -> Result<(FrameHeader, V
 
         warn!("invalid mpeg audio header");
     };
+
+    // Free bit-rate frames do not encode their frame size. Derive it from the next frame's sync
+    // word.
+    if header.is_free_format() {
+        header.frame_size =
+            resolve_free_format_frame_size(reader, &header, free_format_frame_size)?;
+    }
 
     // Allocate frame buffer.
     let mut packet = vec![0u8; MPEG_HEADER_LEN + header.frame_size];
@@ -606,11 +658,103 @@ fn read_mpeg_frame(reader: &mut MediaSourceStream<'_>) -> Result<(FrameHeader, V
     Ok((header, packet))
 }
 
+/// Searches for the next frame's sync word starting from the current position, which must be the
+/// start of a free bit-rate frame's body.
+///
+/// Unlike [`derive_free_format_frame_size`], the reader's position is left just after the found
+/// sync word, or at the search limit if no sync word was found. The caller is responsible for
+/// rewinding the reader.
+///
+/// Returns the size of the current frame's body (excluding the frame header), or `None` if no
+/// following frame was found within the maximum supported free bit-rate frame length.
+fn scan_next_frame_sync<B: ReadBytes>(
+    reader: &mut B,
+    header: &FrameHeader,
+) -> Result<Option<usize>> {
+    let start_pos = reader.pos();
+
+    let mut sync = 0u32;
+
+    while reader.pos() - start_pos < MAX_FREE_FORMAT_FRAME_SIZE as u64 {
+        let byte = match reader.read_byte() {
+            Ok(byte) => byte,
+            // The stream ended before another frame was found.
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(Error::IoError(err)),
+        };
+
+        sync = (sync << 8) | u32::from(byte);
+
+        // The stream must be synced to a sync word, and the sync word must parse into a header
+        // similar to the current frame's header. This rejects sync-like patterns that may appear
+        // in the frame body.
+        if header::is_frame_header_word_synced(sync)
+            && header::check_header(sync)
+            && is_frame_header_similar(header, sync)
+        {
+            // The next frame's header starts right after the current frame's body.
+            return Ok(Some((reader.pos() - start_pos) as usize - MPEG_HEADER_LEN));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Derives the size of a free bit-rate frame's body (excluding the frame header) by searching for
+/// the next frame's sync word.
+///
+/// The reader must be positioned at the start of the current frame's body. It is left at the start
+/// of the body regardless of the outcome.
+///
+/// Returns `None` if no following frame could be found (e.g. this is the last frame in the
+/// stream), or if the next frame's sync word is further than the maximum supported free bit-rate
+/// frame length away.
+fn derive_free_format_frame_size<B: ReadBytes + SeekBuffered>(
+    reader: &mut B,
+    header: &FrameHeader,
+) -> Result<Option<usize>> {
+    let start_pos = reader.pos();
+
+    let frame_size = scan_next_frame_sync(reader, header)?;
+
+    // Rewind back to the start of the current frame's body.
+    reader.seek_buffered(start_pos);
+
+    Ok(frame_size)
+}
+
+/// Resolves the size of a free bit-rate frame's body (excluding the frame header), leaving the
+/// reader at the start of the frame body.
+///
+/// The size is derived from the position of the next frame's sync word. The final frame of a
+/// stream has no following sync word, so it reuses the size derived for the preceding frame. If
+/// neither is possible (e.g. an isolated free bit-rate frame with no adjacent sync word), an
+/// explicit error is returned rather than silently truncating the frame.
+fn resolve_free_format_frame_size<B: ReadBytes + SeekBuffered>(
+    reader: &mut B,
+    header: &FrameHeader,
+    cached: &mut Option<usize>,
+) -> Result<usize> {
+    // Cache the derived size so that the final frame, which has no following sync word, can reuse
+    // it.
+    if let Some(frame_size) = derive_free_format_frame_size(reader, header)? {
+        *cached = Some(frame_size);
+    }
+
+    match *cached {
+        Some(frame_size) => Ok(frame_size),
+        None => decode_error("mpa: cannot determine frame size of free bit-rate frame"),
+    }
+}
+
 /// Reads a MPEG frame and checks if the next frame begins after the packet.
-fn read_mpeg_frame_strict(reader: &mut MediaSourceStream<'_>) -> Result<(FrameHeader, Vec<u8>)> {
+fn read_mpeg_frame_strict(
+    reader: &mut MediaSourceStream<'_>,
+    free_format_frame_size: &mut Option<usize>,
+) -> Result<(FrameHeader, Vec<u8>)> {
     loop {
         // Read the next MPEG frame.
-        let (header, packet) = read_mpeg_frame(reader)?;
+        let (header, packet) = read_mpeg_frame(reader, free_format_frame_size)?;
 
         // Get the position before trying to read the next header.
         let pos = reader.pos();
@@ -680,7 +824,10 @@ fn read_main_data_begin<B: ReadBytes>(reader: &mut B, header: &FrameHeader) -> R
 }
 
 /// Estimates the total number of MPEG frames in the media source stream.
-fn estimate_num_mpeg_frames(reader: &mut MediaSourceStream<'_>) -> Option<u64> {
+fn estimate_num_mpeg_frames(
+    reader: &mut MediaSourceStream<'_>,
+    free_format_frame_size: &mut Option<usize>,
+) -> Option<u64> {
     const MAX_FRAMES: u32 = 16;
     const MAX_LEN: usize = 16 * 1024;
 
@@ -709,7 +856,17 @@ fn estimate_num_mpeg_frames(reader: &mut MediaSourceStream<'_>) -> Option<u64> {
         let header_val = break_on_err!(reader.read_be_u32());
 
         // Parse the frame header.
-        let header = break_on_err!(header::parse_frame_header(header_val));
+        let mut header = break_on_err!(header::parse_frame_header(header_val));
+
+        // Free bit-rate frames do not encode their frame size. Derive it from the next frame's
+        // sync word, or fall back to the size previously derived for this stream.
+        if header.is_free_format() {
+            header.frame_size = break_on_err!(resolve_free_format_frame_size(
+                reader,
+                &header,
+                free_format_frame_size
+            ));
+        }
 
         // Tabulate the size.
         total_frame_len += MPEG_HEADER_LEN + header.frame_size;
@@ -1049,6 +1206,139 @@ fn is_maybe_vbri_tag(buf: &[u8], header: &FrameHeader) -> bool {
 mod tests {
     use super::*;
     use crate::common::{ChannelMode, Emphasis, MpegVersion};
+
+    /// A MPEG1 Layer 3, 44.1 kHz, stereo header with a free bit-rate.
+    const FREE_FORMAT_HEADER: [u8; 4] = [0xff, 0xfb, 0x00, 0x00];
+
+    /// A MPEG1 Layer 3, 44.1 kHz, stereo header at 128 kbit/s. A frame at this bit-rate has the
+    /// same length as a 128 kbit/s equivalent free bit-rate frame.
+    const CBR_HEADER: [u8; 4] = [0xff, 0xfb, 0x90, 0x00];
+
+    /// Builds a free bit-rate frame with the given body length.
+    fn free_format_frame(body_len: usize) -> Vec<u8> {
+        let mut frame = vec![0u8; MPEG_HEADER_LEN + body_len];
+        frame[..MPEG_HEADER_LEN].copy_from_slice(&FREE_FORMAT_HEADER);
+        frame
+    }
+
+    /// Builds a CBR frame with the given body length.
+    fn cbr_frame(body_len: usize) -> Vec<u8> {
+        let mut frame = vec![0u8; MPEG_HEADER_LEN + body_len];
+        frame[..MPEG_HEADER_LEN].copy_from_slice(&CBR_HEADER);
+        frame
+    }
+
+    fn mss(data: Vec<u8>) -> MediaSourceStream<'static> {
+        MediaSourceStream::new(Box::new(std::io::Cursor::new(data)), Default::default())
+    }
+
+    #[test]
+    fn test_parse_free_format_header() {
+        let header =
+            header::parse_frame_header(u32::from_be_bytes(FREE_FORMAT_HEADER)).unwrap();
+
+        assert!(header.is_free_format());
+        assert_eq!(header.bitrate, 0);
+        // The frame size cannot be determined from the header until the next frame's sync word is
+        // found.
+        assert_eq!(header.frame_size, 0);
+
+        // A 417 byte frame is the 128 kbit/s equivalent.
+        let bitrate = header.derive_free_format_bitrate(417);
+        assert!((127_000..=129_000).contains(&bitrate), "unexpected bitrate {bitrate}");
+    }
+
+    #[test]
+    fn test_free_format_stream() {
+        const BODY_LEN: usize = 413;
+
+        // Three free bit-rate frames. The first two derive their frame size from the next frame's
+        // sync word. The last reuses the previously derived frame size.
+        let mut data = free_format_frame(BODY_LEN);
+        data.extend(free_format_frame(BODY_LEN));
+        data.extend(free_format_frame(BODY_LEN));
+
+        let mut reader = mss(data);
+        let mut cache = None;
+
+        for i in 0..3 {
+            let (header, packet) = read_mpeg_frame(&mut reader, &mut cache).unwrap();
+
+            assert!(header.is_free_format(), "frame {i} is not free format");
+            assert_eq!(header.frame_size, BODY_LEN, "frame {i} has the wrong frame size");
+            assert_eq!(packet.len(), MPEG_HEADER_LEN + BODY_LEN);
+            assert_eq!(cache, Some(BODY_LEN));
+        }
+
+        // No more frames.
+        assert!(read_mpeg_frame(&mut reader, &mut cache).is_err());
+    }
+
+    #[test]
+    fn test_free_format_mixed_with_cbr() {
+        const BODY_LEN: usize = 413;
+
+        // A free bit-rate frame followed by two regular CBR frames, followed by a free bit-rate
+        // tail frame.
+        let mut data = free_format_frame(BODY_LEN);
+        data.extend(cbr_frame(BODY_LEN));
+        data.extend(cbr_frame(BODY_LEN));
+        data.extend(free_format_frame(BODY_LEN));
+
+        let mut reader = mss(data);
+        let mut cache = None;
+
+        for i in 0..4 {
+            let (header, packet) = read_mpeg_frame(&mut reader, &mut cache).unwrap();
+
+            if i == 0 || i == 3 {
+                assert!(header.is_free_format(), "frame {i} should be free format");
+                assert_eq!(header.frame_size, BODY_LEN);
+            }
+            else {
+                assert!(!header.is_free_format(), "frame {i} should be CBR");
+                assert_eq!(header.frame_size, BODY_LEN);
+            }
+
+            assert_eq!(packet.len(), MPEG_HEADER_LEN + BODY_LEN);
+        }
+    }
+
+    #[test]
+    fn test_free_format_underivable_frame_size() {
+        const BODY_LEN: usize = 413;
+
+        // An isolated free bit-rate frame with no adjacent sync word to derive the frame size
+        // from. This must return an explicit error rather than silently truncating the frame.
+        let mut reader = mss(free_format_frame(BODY_LEN));
+        let mut cache = None;
+
+        match read_mpeg_frame(&mut reader, &mut cache) {
+            Err(Error::DecodeError(msg)) => {
+                assert_eq!(msg, "mpa: cannot determine frame size of free bit-rate frame")
+            }
+            other => panic!("expected a decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_free_format_reader_packets() {
+        const BODY_LEN: usize = 413;
+
+        let mut data = free_format_frame(BODY_LEN);
+        data.extend(free_format_frame(BODY_LEN));
+        data.extend(free_format_frame(BODY_LEN));
+
+        let mut reader = MpaReader::try_new(mss(data), Default::default()).unwrap();
+
+        let mut packets = 0;
+        while let Some(packet) = reader.next_packet().unwrap() {
+            assert_eq!(packet.data.len(), MPEG_HEADER_LEN + BODY_LEN);
+            packets += 1;
+        }
+
+        assert_eq!(packets, 3);
+    }
 
     #[test]
     fn test_is_maybe_info_tag_with_crc() {

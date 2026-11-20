@@ -85,10 +85,25 @@ impl MpaDecoder {
     fn decode_inner(&mut self, packet: &PacketRef<'_>) -> Result<()> {
         let mut reader = packet.as_buf_reader();
 
-        let header = header::read_frame_header(&mut reader)?;
+        let mut header = header::read_frame_header(&mut reader)?;
 
+        if header.is_free_format() {
+            // Free bit-rate frames do not encode their frame size or bit-rate in the header. The
+            // demuxer derives the frame size from the next frame's sync word and makes the packet
+            // exactly that size. The bit-rate is then derived from the frame size since it is
+            // required to select the Layer 1 & 2 quantization tables.
+            let frame_size = reader.bytes_available() as usize;
+
+            if frame_size == 0 {
+                return decode_error("mpa: empty free bit-rate packet");
+            }
+
+            header.frame_size = frame_size;
+            header.bitrate =
+                header.derive_free_format_bitrate(header::MPEG_HEADER_LEN + frame_size);
+        }
         // The packet should be the size stated in the header.
-        if header.frame_size != reader.bytes_available() as usize {
+        else if header.frame_size != reader.bytes_available() as usize {
             return decode_error("mpa: invalid packet length");
         }
 
@@ -193,5 +208,68 @@ impl RegisterableAudioDecoder for MpaDecoder {
             #[cfg(feature = "mp3")]
             support_audio_codec!(CODEC_ID_MP3, "mp3", "MPEG Audio Layer 3"),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use symphonia_core::errors::Error;
+    use symphonia_core::packet::Packet;
+
+    fn decode_packet(data: Vec<u8>) -> Result<()> {
+        let mut params = AudioCodecParameters::new();
+        params.for_codec(CODEC_ID_MP3).with_sample_rate(44100);
+
+        let mut decoder = MpaDecoder::try_new(&params, &AudioDecoderOptions::default())?;
+
+        let packet = Packet::new(0, 0i32.into(), 1152u32.into(), data);
+
+        decoder.decode(&packet).map(|_| ())
+    }
+
+    #[test]
+    fn test_decode_free_format_packet() {
+        // A MPEG1 Layer 3, 44.1 kHz, stereo free bit-rate frame. The packet length determines the
+        // frame size, and from that, the bit-rate. The zeroed frame body is not valid audio, but
+        // it exercises packet sizing and header derivation without a panic.
+        let mut data = vec![0u8; 419];
+        data[..4].copy_from_slice(&[0xff, 0xfb, 0x00, 0x00]);
+
+        // The frame is not necessarily decodable, but it must not fail packet sizing.
+        match decode_packet(data) {
+            Ok(()) => (),
+            Err(Error::DecodeError(msg)) => {
+                assert_ne!(msg, "mpa: invalid packet length");
+                assert_ne!(msg, "mpa: empty free bit-rate packet");
+            }
+            Err(err) => panic!("unexpected error {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_empty_free_format_packet() {
+        // A free bit-rate header with no body must produce an explicit error rather than being
+        // treated as a zero-length frame.
+        let data = vec![0xff, 0xfb, 0x00, 0x00];
+
+        match decode_packet(data) {
+            Err(Error::DecodeError(msg)) => {
+                assert_eq!(msg, "mpa: empty free bit-rate packet")
+            }
+            other => panic!("expected a decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_cbr_packet_length_mismatch() {
+        // A regular CBR frame with a truncated body must still be rejected.
+        let mut data = vec![0u8; 100];
+        data[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
+
+        match decode_packet(data) {
+            Err(Error::DecodeError(msg)) => assert_eq!(msg, "mpa: invalid packet length"),
+            other => panic!("expected a decode error, got {other:?}"),
+        }
     }
 }

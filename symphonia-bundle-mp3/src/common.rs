@@ -117,10 +117,47 @@ pub struct FrameHeader {
 }
 
 impl FrameHeader {
-    /// Returns true if this a MPEG1 frame, false otherwise.
+    /// Returns true if this is a MPEG1 frame, false otherwise.
     #[inline(always)]
     pub fn is_mpeg1(&self) -> bool {
         self.version == MpegVersion::Mpeg1
+    }
+
+    /// Returns true if this frame uses a free bit-rate.
+    ///
+    /// Free bit-rate frames do not encode their bit-rate, and therefore their frame size, in the
+    /// frame header. The frame size must instead be derived from the position of the next frame's
+    /// sync word.
+    #[inline(always)]
+    pub fn is_free_format(&self) -> bool {
+        self.bitrate == 0
+    }
+
+    /// Derives the bit-rate of a free bit-rate frame from the total length of the frame, in bytes,
+    /// including the standard frame header and optional CRC.
+    ///
+    /// The result is an approximation because the header only encodes the frame length in slots,
+    /// and the length is truncated when computed from the bit-rate. It is nevertheless accurate
+    /// enough to select the appropriate Layer 2 quantization tables.
+    pub fn derive_free_format_bitrate(&self, frame_len: usize) -> u32 {
+        // Constants provided for size calculation in section ISO-11172 section 2.4.3.1.
+        let factor = match self.layer {
+            MpegLayer::Layer1 => 12u64,
+            MpegLayer::Layer2 => 144,
+            MpegLayer::Layer3 if self.is_mpeg1() => 144,
+            MpegLayer::Layer3 => 72,
+        };
+
+        // For layers 2 & 3 a slot is 1 byte, however for layer 1 a slot is 4 bytes.
+        let slot_size = match self.layer {
+            MpegLayer::Layer1 => 4,
+            _ => 1,
+        };
+
+        // Convert the total frame length to slots, then remove the padding slot if present.
+        let slots = (frame_len / slot_size).saturating_sub(usize::from(self.has_padding));
+
+        (slots as u64 * u64::from(self.sample_rate) / factor) as u32
     }
 
     /// Returns true if this a MPEG2.5 frame, false otherwise.

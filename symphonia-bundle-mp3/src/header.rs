@@ -5,7 +5,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::errors::{Result, decode_error, unsupported_error};
+use symphonia_core::errors::{Result, decode_error};
 use symphonia_core::io::ReadBytes;
 
 use crate::common::*;
@@ -15,6 +15,13 @@ pub const MPEG_HEADER_LEN: usize = 4;
 
 /// The maximum length in bytes of a MPEG audio frame including the header.
 pub const MAX_MPEG_FRAME_SIZE: usize = 2881;
+
+/// The maximum length in bytes of a free bit-rate MPEG audio frame including the header.
+///
+/// Free bit-rate frames do not encode their length, so an upper-bound is required to bound the
+/// search for the next frame's sync word. Allow 4x the maximum length of a regular frame since the
+/// bit-rate of a free bit-rate frame is arbitrary.
+pub const MAX_FREE_FORMAT_FRAME_SIZE: usize = 4 * MAX_MPEG_FRAME_SIZE;
 
 /// Bit-rate lookup table for MPEG version 1 layer 1.
 const BIT_RATES_MPEG1_L1: [u32; 15] = [
@@ -124,8 +131,10 @@ pub fn parse_frame_header(header: u32) -> Result<FrameHeader> {
 
     let bitrate = match ((header & 0xf000) >> 12, version, layer) {
         // "Free" bit-rate. Note, this is NOT variable bit-rate and is not a mandatory feature of
-        // MP3 decoders.
-        (0b0000, _, _) => return unsupported_error("mpa: free bit-rate is not supported"),
+        // MP3 decoders. The bit-rate, and therefore the frame size, is not encoded in the header.
+        // A bit-rate of 0 indicates a free bit-rate frame and the frame size must be derived from
+        // the position of the next frame's sync word by the demuxer.
+        (0b0000, _, _) => 0,
         // Invalid bit-rate.
         (0b1111, _, _) => return decode_error("mpa: invalid bit-rate"),
         // MPEG 1 bit-rates.
@@ -212,11 +221,19 @@ pub fn parse_frame_header(header: u32) -> Result<FrameHeader> {
         _ => 1,
     };
 
-    // Calculate the total frame size in number of slots.
-    let frame_size_slots = (factor * bitrate / sample_rate) as usize + usize::from(has_padding);
+    // Free bit-rate frames do not encode their frame size. A frame size of 0 indicates that the
+    // frame size is unknown, and must be derived by the demuxer from the next frame's sync word.
+    let frame_size = if bitrate == 0 {
+        0
+    }
+    else {
+        // Calculate the total frame size in number of slots.
+        let frame_size_slots =
+            (factor * bitrate / sample_rate) as usize + usize::from(has_padding);
 
-    // Calculate the frame size in bytes, excluding the header.
-    let frame_size = (frame_size_slots * slot_size) - 4;
+        // Calculate the frame size in bytes, excluding the header.
+        (frame_size_slots * slot_size) - MPEG_HEADER_LEN
+    };
 
     Ok(FrameHeader {
         version,

@@ -149,7 +149,8 @@ fn find_sb_info(header: &FrameHeader) -> &'static SbInfo {
         }
         else {
             // Table 3-B.2a and 3-B.2b as always used for bitrates > 80 kbit/s.
-            // TODO: Free format also used this case, but we don't support it.
+            // Free bit-rate frames derive their bit-rate from the frame size, so this also applies
+            // to free bit-rate frames.
             usize::from(header.sample_rate != 48_000)
         }
     }
